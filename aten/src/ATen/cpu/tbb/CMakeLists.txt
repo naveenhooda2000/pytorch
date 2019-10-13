@@ -21,6 +21,12 @@ endif()
 if(NOT TBB_ROOT_DIR)
   set(TBB_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
+if(NOT TBB_INSTALL_EXPORT_NAME)
+  set(TBB_INSTALL_EXPORT_NAME "Caffe2Targets")
+endif()
+if(NOT TBB_INSTALL_EXPORT_DESTINATION)
+  set(TBB_INSTALL_EXPORT_DESTINATION lib)
+endif()
 if(NOT TBB_INSTALL_RUNTIME_DIR)
   set(TBB_INSTALL_RUNTIME_DIR bin)
 endif()
@@ -34,7 +40,11 @@ if(NOT TBB_INSTALL_INCLUDE_DIR)
   set(TBB_INSTALL_INCLUDE_DIR "${TBB_ROOT_DIR}/include")
 endif()
 
-include_directories("${TBB_ROOT_DIR}/include" "${TBB_ROOT_DIR}/src" "${TBB_ROOT_DIR}/src/rml/include" ${CMAKE_CURRENT_BINARY_DIR})
+set(TBB_INCLUDES
+  "${TBB_ROOT_DIR}/include"
+  "${TBB_ROOT_DIR}/src"
+  "${TBB_ROOT_DIR}/src/rml/include"
+  ${CMAKE_CURRENT_BINARY_DIR})
 
 option(TBB_BUILD_SHARED          "Build TBB shared library" ON)
 option(TBB_BUILD_STATIC          "Build TBB static library" ON)
@@ -50,7 +60,9 @@ endif()
 file(GLOB tbb_src "${TBB_ROOT_DIR}/src/tbb/*.cpp" "${TBB_ROOT_DIR}/src/old/*.cpp")
 list(APPEND tbb_src ${TBB_ROOT_DIR}/src/rml/client/rml_tbb.cpp)
 file(GLOB to_remove "${TBB_ROOT_DIR}/src/old/test*.cpp")
-list(REMOVE_ITEM tbb_src ${to_remove})
+if (NOT "${to_remove}" STREQUAL "")
+  list(REMOVE_ITEM tbb_src ${to_remove})
+endif()
 
 set(tbbmalloc_static_src
   src/tbbmalloc/backend.cpp
@@ -109,12 +121,12 @@ endif()
 if (UNIX)
   add_definitions (-DUSE_PTHREAD)
 
-  check_cxx_compiler_flag ("-std=c++11" SUPPORTS_STDCXX11)
+   check_cxx_compiler_flag ("-std=c++11" SUPPORTS_STDCXX11)
   if (SUPPORTS_STDCXX11)
     set (CMAKE_CXX_FLAGS "-std=c++11 ${CMAKE_CXX_FLAGS}")
   endif ()
 
-  check_cxx_compiler_flag ("-mrtm -Werror" SUPPORTS_MRTM)
+   check_cxx_compiler_flag ("-mrtm -Werror" SUPPORTS_MRTM)
   if (SUPPORTS_MRTM)
     set (CMAKE_CXX_FLAGS "-mrtm ${CMAKE_CXX_FLAGS}")
   endif ()
@@ -134,7 +146,7 @@ elseif(WIN32)
        message(FATAL_ERROR "'CMAKE_SIZEOF_VOID_P' is undefined. Please delete your build directory and rerun CMake again!")
     endif()
 
-    if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+     if (CMAKE_SIZEOF_VOID_P EQUAL 8)
       list(APPEND tbb_src "${TBB_ROOT_DIR}/src/tbb/intel64-masm/atomic_support.asm")
       list(APPEND tbb_src "${TBB_ROOT_DIR}/src/tbb/intel64-masm/itsx.asm")
       list(APPEND tbb_src "${TBB_ROOT_DIR}/src/tbb/intel64-masm/intel64_misc.asm")
@@ -179,10 +191,10 @@ endif()
 ##-------
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-   check_cxx_compiler_flag ("-flifetime-dse=1" SUPPORTS_FLIFETIME)
-   if (SUPPORTS_FLIFETIME)
-     add_definitions(-flifetime-dse=1)
-   endif()
+  check_cxx_compiler_flag ("-flifetime-dse=1" SUPPORTS_FLIFETIME)
+  if (SUPPORTS_FLIFETIME)
+    add_definitions(-flifetime-dse=1)
+  endif()
 endif()
 
 # Linker export definitions
@@ -237,9 +249,12 @@ add_custom_target(tbb_def_files DEPENDS tbb.def tbbmalloc.def)
 # TBB library
 if (TBB_BUILD_STATIC)
   add_library(tbb_static STATIC ${tbb_src})
+  target_include_directories(tbb_static PRIVATE ${TBB_INCLUDES})
   set_property(TARGET tbb_static APPEND PROPERTY COMPILE_DEFINITIONS "__TBB_BUILD=1")
   set_property(TARGET tbb_static APPEND_STRING PROPERTY COMPILE_FLAGS ${ENABLE_RTTI})
-  install(TARGETS tbb_static ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR})
+  install(TARGETS tbb_static
+          EXPORT ${TBB_INSTALL_EXPORT_NAME} DESTINATION ${TBB_INSTALL_EXPORT_DESTINATION}
+          ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR})
   if (MSVC)
     target_compile_definitions(tbb_static PUBLIC __TBB_NO_IMPLICIT_LINKAGE=1)
   endif()
@@ -251,6 +266,7 @@ endif()
 
 if (TBB_BUILD_SHARED)
   add_library(tbb SHARED ${tbb_src})
+  target_include_directories(tbb PRIVATE ${TBB_INCLUDES})
   set_property(TARGET tbb APPEND PROPERTY COMPILE_DEFINITIONS "__TBB_BUILD=1")
   set_property(TARGET tbb APPEND_STRING PROPERTY COMPILE_FLAGS ${ENABLE_RTTI})
   add_dependencies(tbb tbb_def_files)
@@ -264,6 +280,7 @@ if (TBB_BUILD_SHARED)
   endif()
 
   install(TARGETS tbb
+          EXPORT ${TBB_INSTALL_EXPORT_NAME} DESTINATION ${TBB_INSTALL_EXPORT_DESTINATION}
           LIBRARY DESTINATION ${TBB_INSTALL_LIBRARY_DIR}
           ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR}
           RUNTIME DESTINATION ${TBB_INSTALL_RUNTIME_DIR})
@@ -291,16 +308,20 @@ if(TBB_BUILD_TBBMALLOC)
   # TBB malloc library
   if (TBB_BUILD_STATIC)
     add_library(tbbmalloc_static STATIC ${tbbmalloc_static_src})
+    target_include_directories(tbbmalloc_static PRIVATE ${TBB_INCLUDES})
     set_property(TARGET tbbmalloc_static APPEND PROPERTY COMPILE_DEFINITIONS "__TBBMALLOC_BUILD=1")
     set_property(TARGET tbbmalloc_static APPEND_STRING PROPERTY COMPILE_FLAGS ${DISABLE_RTTI})
     if (MSVC)
       target_compile_definitions(tbbmalloc_static PUBLIC __TBB_NO_IMPLICIT_LINKAGE=1 __TBBMALLOC_NO_IMPLICIT_LINKAGE=1)
     endif()
-    install(TARGETS tbbmalloc_static ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR})
+    install(TARGETS tbbmalloc_static
+            EXPORT ${TBB_INSTALL_EXPORT_NAME} DESTINATION ${TBB_INSTALL_EXPORT_DESTINATION}
+            ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR})
   endif()
 
   if (TBB_BUILD_SHARED)
     add_library(tbbmalloc SHARED ${tbbmalloc_src})
+    target_include_directories(tbbmalloc PRIVATE ${TBB_INCLUDES})
     set_property(TARGET tbbmalloc APPEND PROPERTY COMPILE_DEFINITIONS "__TBBMALLOC_BUILD=1")
     set_property(TARGET tbbmalloc APPEND_STRING PROPERTY COMPILE_FLAGS ${DISABLE_RTTI})
     add_dependencies(tbbmalloc tbb_def_files)
@@ -315,6 +336,7 @@ if(TBB_BUILD_TBBMALLOC)
       target_compile_definitions(tbbmalloc PUBLIC __TBB_NO_IMPLICIT_LINKAGE=1 __TBBMALLOC_NO_IMPLICIT_LINKAGE=1)
     endif()
     install(TARGETS tbbmalloc
+            EXPORT ${TBB_INSTALL_EXPORT_NAME} DESTINATION ${TBB_INSTALL_EXPORT_DESTINATION}
             LIBRARY DESTINATION ${TBB_INSTALL_LIBRARY_DIR}
             ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR}
             RUNTIME DESTINATION ${TBB_INSTALL_RUNTIME_DIR})
@@ -330,7 +352,9 @@ if(TBB_BUILD_TBBMALLOC_PROXY)
     add_library(tbbmalloc_proxy_static STATIC ${tbbmalloc_proxy_src})
     set_property(TARGET tbbmalloc_proxy_static APPEND PROPERTY COMPILE_DEFINITIONS "__TBBMALLOC_BUILD=1")
     set_property(TARGET tbbmalloc_proxy_static APPEND_STRING PROPERTY COMPILE_FLAGS ${DISABLE_RTTI})
-    install(TARGETS tbbmalloc_proxy_static ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR})
+    install(TARGETS tbbmalloc_proxy_static
+            EXPORT ${TBB_INSTALL_EXPORT_NAME} DESTINATION ${TBB_INSTALL_EXPORT_DESTINATION}
+            ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR})
   endif()
 
   if (TBB_BUILD_SHARED)
@@ -339,6 +363,7 @@ if(TBB_BUILD_TBBMALLOC_PROXY)
     set_property(TARGET tbbmalloc_proxy APPEND_STRING PROPERTY COMPILE_FLAGS ${DISABLE_RTTI})
     target_link_libraries(tbbmalloc_proxy PUBLIC tbbmalloc)
     install(TARGETS tbbmalloc_proxy
+            EXPORT ${TBB_INSTALL_EXPORT_NAME} DESTINATION ${TBB_INSTALL_EXPORT_DESTINATION}
             LIBRARY DESTINATION ${TBB_INSTALL_LIBRARY_DIR}
             ARCHIVE DESTINATION ${TBB_INSTALL_ARCHIVE_DIR}
             RUNTIME DESTINATION ${TBB_INSTALL_RUNTIME_DIR})

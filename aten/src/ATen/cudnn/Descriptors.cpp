@@ -1,12 +1,17 @@
-#include "Descriptors.h"
+#include <ATen/cudnn/Descriptors.h>
+
 #include <ATen/ATen.h>
+
+#include <ostream>
+#include <sstream>
+#include <string>
 
 namespace at { namespace native {
 
 namespace {
 
-inline cudnnDataType_t getDataType(const at::Type& t) {
-  auto scalar_type = t.scalarType();
+inline cudnnDataType_t getDataType(const at::Tensor& t) {
+  auto scalar_type = t.scalar_type();
   if (scalar_type == at::kFloat) {
     return CUDNN_DATA_FLOAT;
   } else if (scalar_type == at::kHalf) {
@@ -17,10 +22,6 @@ inline cudnnDataType_t getDataType(const at::Type& t) {
   throw std::runtime_error("TensorDescriptor only supports double, float and half tensors");
 }
 
-inline cudnnDataType_t getDataType(const at::Tensor& t) {
-  return getDataType(t.type());
-}
-
 } // anonymous namespace
 
 
@@ -28,7 +29,7 @@ void TensorDescriptor::set(const at::Tensor &t, size_t pad) {
   set(getDataType(t), t.sizes(), t.strides(), pad);
 }
 
-void TensorDescriptor::set(cudnnDataType_t datatype, IntList t_sizes, IntList t_strides, size_t pad) {
+void TensorDescriptor::set(cudnnDataType_t datatype, IntArrayRef t_sizes, IntArrayRef t_strides, size_t pad) {
   size_t dim = t_sizes.size();
   if (dim > CUDNN_DIM_MAX || pad > CUDNN_DIM_MAX)
 #define _STR(X) #X
@@ -63,10 +64,17 @@ std::string cudnnTypeToString(cudnnDataType_t dtype) {
       return "CUDNN_DATA_INT32";
     case CUDNN_DATA_INT8x4:
       return "CUDNN_DATA_INT8x4";
+#if CUDNN_VERSION >= 7100
+    case CUDNN_DATA_UINT8:
+      return "CUDNN_DATA_UINT8";
+    case CUDNN_DATA_UINT8x4:
+      return "CUDNN_DATA_UINT8x4";
+#endif
+    default:
+      std::ostringstream oss;
+      oss << "(unknown data-type " << static_cast<int>(dtype) << ")";
+      return oss.str();
   }
-  std::ostringstream oss;
-  oss << "(unknown data-type " << static_cast<int>(dtype) << ")";
-  return oss.str();
 }
 
 std::ostream& operator<<(std::ostream & out, const TensorDescriptor& d) {

@@ -1,75 +1,21 @@
 import argparse
 import cProfile
 import pstats
-import subprocess
 import sys
 import os
-import re
-import contextlib
 
 import torch
 from torch.autograd import profiler
-
-PY3 = sys.version_info >= (3, 0)
-
-
-def run(command):
-    """Returns (return-code, stdout, stderr)"""
-    p = subprocess.Popen(command, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, shell=True)
-    output, err = p.communicate()
-    rc = p.returncode
-    if PY3:
-        output = output.decode("ascii")
-        err = err.decode("ascii")
-    return (rc, output, err)
+from torch.utils.collect_env import get_env_info
 
 
 def redirect_argv(new_argv):
     sys.argv[:] = new_argv[:]
 
 
-def check_running_cuda_version():
-    (rc, out, err) = run('nvcc --version')
-    if rc is not 0:
-        return None
-    m = re.search(r'V(.*)$', out)
-    assert m is not None
-    return m.group(1)
-
-
-def check_pip_packages():
-    # People generally have `pip` as `pip` or `pip3`
-    def run_with_pip(pip):
-        rc, out, _ = run(pip + ' list --format=legacy | grep torch')
-        if rc is 0:
-            return out
-        return None
-
-    if not PY3:
-        return 'pip', run_with_pip('pip')
-
-    # Try to figure out if the user is running pip or pip3.
-    out2 = run_with_pip('pip')
-    out3 = run_with_pip('pip3')
-
-    num_pips = len([x for x in [out2, out3] if x is not None])
-    if num_pips is 0:
-        return 'pip', out2
-
-    if num_pips == 1:
-        if out2 is not None:
-            return 'pip', out2
-        return 'pip3', out3
-
-    # num_pips is 2. Return pip3 by default b/c that most likely
-    # is the one associated with Python 3
-    return 'pip3', out3
-
-
-def compiled_with_cuda():
-    if torch.version.cuda:
-        return 'compiled w/ CUDA {}'.format(torch.version.cuda)
+def compiled_with_cuda(sysinfo):
+    if sysinfo.cuda_compiled_version:
+        return 'compiled w/ CUDA {}'.format(sysinfo.cuda_compiled_version)
     return 'not compiled w/ CUDA'
 
 
@@ -87,28 +33,31 @@ Running with Python {py_version} and {cuda_runtime}
 
 def run_env_analysis():
     print('Running environment analysis...')
+    info = get_env_info()
+
     result = []
 
     debug_str = ''
-    if torch.version.debug:
+    if info.is_debug_build:
         debug_str = ' DEBUG'
 
     cuda_avail = ''
-    if torch.cuda.is_available():
-        cuda = check_running_cuda_version()
+    if info.is_cuda_available:
+        cuda = info.cuda_runtime_version
         if cuda is not None:
             cuda_avail = 'CUDA ' + cuda
     else:
         cuda = 'CUDA unavailable'
 
-    pip_version, pip_list_output = check_pip_packages()
+    pip_version = info.pip_version
+    pip_list_output = info.pip_packages
     if pip_list_output is None:
         pip_list_output = 'Unable to fetch'
 
     result = {
         'debug_str': debug_str,
-        'pytorch_version': torch.__version__,
-        'cuda_compiled': compiled_with_cuda(),
+        'pytorch_version': info.torch_version,
+        'cuda_compiled': compiled_with_cuda(info),
         'py_version': '{}.{}'.format(sys.version_info[0], sys.version_info[1]),
         'cuda_runtime': cuda_avail,
         'pip_version': pip_version,
@@ -178,7 +127,7 @@ def print_autograd_prof_summary(prof, mode, sortby='cpu_time', topk=15):
         print(warn.format(autograd_prof_sortby))
         sortby = 'cpu_time'
 
-    if mode is 'CUDA':
+    if mode == 'CUDA':
         cuda_warning = ('\n\tBecause the autograd profiler uses the CUDA event API,\n'
                         '\tthe CUDA time column reports approximately max(cuda_time, cpu_time).\n'
                         '\tPlease ignore this output if your code does not use CUDA.\n')
@@ -209,7 +158,7 @@ exits in a finite amount of time.
 
 For more complicated uses of the profilers, please see
 https://docs.python.org/3/library/profile.html and
-http://pytorch.org/docs/master/autograd.html#profiler for more information.
+https://pytorch.org/docs/master/autograd.html#profiler for more information.
 """.strip()
 
 
@@ -218,7 +167,7 @@ def parse_args():
     parser.add_argument('scriptfile', type=str,
                         help='Path to the script to be run. '
                         'Usually run with `python path/to/script`.')
-    parser.add_argument('args', type=str, nargs='*',
+    parser.add_argument('args', type=str, nargs=argparse.REMAINDER,
                         help='Command-line arguments to be passed to the script.')
     return parser.parse_args()
 
@@ -270,10 +219,12 @@ def main():
     # Print both the result of the CPU-mode and CUDA-mode autograd profilers
     # if their execution times are very different.
     cuda_prof_exec_time = cpu_time_total(autograd_prof_cuda)
-    cpu_prof_exec_time = cpu_time_total(autograd_prof_cpu)
-    pct_diff = cuda_prof_exec_time - cpu_prof_exec_time / cuda_prof_exec_time
-    if abs(pct_diff) > 0.05:
-        print_autograd_prof_summary(autograd_prof_cpu, 'CPU', autograd_prof_sortby, autograd_prof_topk)
+    if len(autograd_prof_cpu.function_events) > 0:
+        cpu_prof_exec_time = cpu_time_total(autograd_prof_cpu)
+        pct_diff = (cuda_prof_exec_time - cpu_prof_exec_time) / cuda_prof_exec_time
+        if abs(pct_diff) > 0.05:
+            print_autograd_prof_summary(autograd_prof_cpu, 'CPU', autograd_prof_sortby, autograd_prof_topk)
+
     print_autograd_prof_summary(autograd_prof_cuda, 'CUDA', autograd_prof_sortby, autograd_prof_topk)
 
 if __name__ == '__main__':

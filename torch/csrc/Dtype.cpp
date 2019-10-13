@@ -1,110 +1,109 @@
-#include "Dtype.h"
+#include <torch/csrc/Dtype.h>
 
 #include <cstring>
 #include <structmember.h>
-#include "torch/csrc/Exceptions.h"
-#include "torch/csrc/utils/object_ptr.h"
-#include "torch/csrc/utils/python_strings.h"
-#include "torch/csrc/utils/tensor_dtypes.h"
-#include "torch/csrc/utils/tensor_types.h"
+#include <torch/csrc/Exceptions.h>
+#include <torch/csrc/utils/object_ptr.h>
+#include <torch/csrc/utils/python_strings.h>
+#include <torch/csrc/utils/tensor_dtypes.h>
+#include <torch/csrc/utils/tensor_types.h>
 
-PyObject * THPDtype_New(at::Type* cdata, const std::string& name, bool is_cuda, bool is_sparse)
+PyObject * THPDtype_New(at::ScalarType scalar_type, const std::string& name)
 {
+  AT_ASSERT(name.length() < DTYPE_NAME_LEN);
   auto type = (PyTypeObject*)&THPDtypeType;
   auto self = THPObjectPtr{type->tp_alloc(type, 0)};
   if (!self) throw python_error();
   auto self_ = reinterpret_cast<THPDtype*>(self.get());
-  self_->cdata = cdata;
-  std::strncpy (self_->name, name.c_str(), DTYPE_NAME_LEN);
-  self_->name[DTYPE_NAME_LEN] = '\0';
-  self_->is_cuda = is_cuda;
-  self_->is_sparse = is_sparse;
+  self_->scalar_type = scalar_type;
+  std::strncpy(self_->name, name.c_str(), DTYPE_NAME_LEN);
   return self.release();
 }
 
-PyObject *THPDtype_repr(THPDtype *self)
+PyObject *THPDtype_is_floating_point(THPDtype *self, PyObject *noargs)
 {
+  if (at::isFloatingType(self->scalar_type) || at::isComplexType(self->scalar_type)) {
+    Py_RETURN_TRUE;
+  } else {
+    Py_RETURN_FALSE;
+  }
+}
+
+PyObject *THPDtype_reduce(THPDtype *self, PyObject *noargs)
+{
+  /*
+  * For singletons, a string is returned. The string should be interpreted
+  * as the name of a global variable.
+  */
   return THPUtils_packString(self->name);
-}
-
-PyObject *THPDtype_get_cdata(THPDtype *self)
-{
-  return PyLong_FromVoidPtr(self->cdata);
-}
-
-PyObject *THPDtype_is_cuda(THPDtype *self)
-{
-  if (self->is_cuda) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-}
-
-PyObject *THPDtype_is_sparse(THPDtype *self)
-{
-  if (self->is_sparse) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
 }
 
 typedef PyObject *(*getter)(PyObject *, void *);
 
 static struct PyGetSetDef THPDtype_properties[] = {
-  {"_cdata",       (getter)THPDtype_get_cdata, nullptr, nullptr, nullptr},
-  {"is_cuda",      (getter)THPDtype_is_cuda, nullptr, nullptr, nullptr},
-  {"is_sparse",    (getter)THPDtype_is_sparse, nullptr, nullptr, nullptr},
+  {"is_floating_point", (getter)THPDtype_is_floating_point, nullptr, nullptr, nullptr},
   {nullptr}
 };
+
+static PyMethodDef THPDtype_methods[] = {
+  {"__reduce__", (PyCFunction)THPDtype_reduce, METH_NOARGS, nullptr},
+  {nullptr}  /* Sentinel */
+};
+
+PyObject *THPDtype_repr(THPDtype *self)
+{
+  std::string name = self->name;
+  return THPUtils_packString("torch." + name);
+}
 
 PyTypeObject THPDtypeType = {
   PyVarObject_HEAD_INIT(nullptr, 0)
   "torch.dtype",                         /* tp_name */
   sizeof(THPDtype),                      /* tp_basicsize */
   0,                                     /* tp_itemsize */
-  0,                                     /* tp_dealloc */
-  0,                                     /* tp_print */
-  0,                                     /* tp_getattr */
-  0,                                     /* tp_setattr */
-  0,                                     /* tp_reserved */
+  nullptr,                                     /* tp_dealloc */
+  nullptr,                                     /* tp_print */
+  nullptr,                                     /* tp_getattr */
+  nullptr,                                     /* tp_setattr */
+  nullptr,                                     /* tp_reserved */
   (reprfunc)THPDtype_repr,               /* tp_repr */
-  0,                                     /* tp_as_number */
-  0,                                     /* tp_as_sequence */
-  0,                                     /* tp_as_mapping */
-  0,                                     /* tp_hash  */
-  0,                                     /* tp_call */
-  0,                                     /* tp_str */
-  0,                                     /* tp_getattro */
-  0,                                     /* tp_setattro */
-  0,                                     /* tp_as_buffer */
+  nullptr,                                     /* tp_as_number */
+  nullptr,                                     /* tp_as_sequence */
+  nullptr,                                     /* tp_as_mapping */
+  nullptr,                                     /* tp_hash  */
+  nullptr,                                     /* tp_call */
+  nullptr,                                     /* tp_str */
+  nullptr,                                     /* tp_getattro */
+  nullptr,                                     /* tp_setattro */
+  nullptr,                                     /* tp_as_buffer */
   Py_TPFLAGS_DEFAULT,                    /* tp_flags */
   nullptr,                               /* tp_doc */
-  0,                                     /* tp_traverse */
-  0,                                     /* tp_clear */
-  0,                                     /* tp_richcompare */
+  nullptr,                                     /* tp_traverse */
+  nullptr,                                     /* tp_clear */
+  nullptr,                                     /* tp_richcompare */
   0,                                     /* tp_weaklistoffset */
-  0,                                     /* tp_iter */
-  0,                                     /* tp_iternext */
-  0,                                     /* tp_methods */
-  0,                                     /* tp_members */
+  nullptr,                                     /* tp_iter */
+  nullptr,                                     /* tp_iternext */
+  THPDtype_methods,                      /* tp_methods */
+  nullptr,                                     /* tp_members */
   THPDtype_properties,                   /* tp_getset */
-  0,                                     /* tp_base */
-  0,                                     /* tp_dict */
-  0,                                     /* tp_descr_get */
-  0,                                     /* tp_descr_set */
+  nullptr,                                     /* tp_base */
+  nullptr,                                     /* tp_dict */
+  nullptr,                                     /* tp_descr_get */
+  nullptr,                                     /* tp_descr_set */
   0,                                     /* tp_dictoffset */
-  0,                                     /* tp_init */
-  0,                                     /* tp_alloc */
-  0,                                     /* tp_new */
+  nullptr,                                     /* tp_init */
+  nullptr,                                     /* tp_alloc */
+  nullptr,                                     /* tp_new */
 };
 
-bool THPDtype_init(PyObject *module)
+void THPDtype_init(PyObject *module)
 {
-  if (PyType_Ready(&THPDtypeType) < 0)
-    return false;
+  if (PyType_Ready(&THPDtypeType) < 0) {
+    throw python_error();
+  }
   Py_INCREF(&THPDtypeType);
-  PyModule_AddObject(module, "dtype", (PyObject *)&THPDtypeType);
-  return true;
+  if (PyModule_AddObject(module, "dtype", (PyObject *)&THPDtypeType) != 0) {
+    throw python_error();
+  }
 }

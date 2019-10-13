@@ -1,118 +1,216 @@
-#include "ATen/native/cpu/ReduceOpsKernel.h"
-#include "ATen/Dispatch.h"
-#include "ATen/Parallel.h"
+#include <numeric>
+#include <iterator>
+#include <algorithm>
+#include <limits>
 
-namespace at {
-namespace native {
+#include <ATen/Dispatch.h>
+#include <ATen/cpu/vec256/vec256.h>
+#include <ATen/native/ReduceOps.h>
+#include <ATen/native/TensorIterator.h>
+#include <ATen/native/SharedReduceOps.h>
+#include <ATen/native/cpu/Reduce.h>
+#include <c10/util/Optional.h>
+
+namespace at { namespace native { namespace {
 
 using namespace vec256;
 
-// This adds the content of arr to sum
-template <class scalar_t, template <class> class OP, CPUCapability C>
-inline scalar_t allreduce_kernel_(const scalar_t *arr, size_t start, size_t end,
-                                  scalar_t sum) {
-  Vec256<scalar_t> part_sum;
-  // Use all 16 registers.
-  Vec256<scalar_t> tmp_sum[4], tmp_sum1, tmp_sum2, tmp_sum3;
-  Vec256<scalar_t> a[8];
-  size_t width =
-      256 / sizeof(scalar_t); // primitives per 256 bytes (two cache lines)
-  size_t epr = 32 / sizeof(scalar_t); // primitives per Vec256
-  size_t k = 0;
-  for (; k < (end - start) / width; k++) {
-    for (size_t i = 0; i < 8; i++) {
-      a[i].load(arr + (k * width) + i * epr + start);
-    }
-    for (size_t i = 0; i < 8; i += 2) {
-      tmp_sum[i / 2] = OP<Vec256<scalar_t>>()(a[i], a[i + 1]);
-    }
-    tmp_sum1 = OP<Vec256<scalar_t>>()(tmp_sum[0], tmp_sum[1]);
-    tmp_sum2 = OP<Vec256<scalar_t>>()(tmp_sum[2], tmp_sum[3]);
-    if (k == 0) {
-      part_sum = OP<Vec256<scalar_t>>()(tmp_sum1, tmp_sum2);
-    } else {
-      tmp_sum3 = OP<Vec256<scalar_t>>()(tmp_sum1, tmp_sum2);
-      part_sum = OP<Vec256<scalar_t>>()(part_sum, tmp_sum3);
-    }
-  }
-  if (k > 0) {
-    scalar_t sarr[32 / sizeof(scalar_t)];
-    part_sum.store(sarr);
-    for (size_t i = 0; i < part_sum.size(); i++) {
-      sum = OP<scalar_t>()(sum, sarr[i]);
-    }
-  }
-  k = k * width + start;
-  for (; k < end; k++) {
-    sum = OP<scalar_t>()(sum, arr[k]);
-  }
-  return sum;
+static void sum_kernel_impl(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES_AND2(
+      ScalarType::BFloat16, ScalarType::Bool, iter.dtype(), "sum_cpu", [&] {
+        binary_kernel_reduce_vec(
+            iter, [=](scalar_t a, scalar_t b) -> scalar_t { return a + b; },
+            [=](Vec256<scalar_t> a, Vec256<scalar_t> b) { return a + b; });
+      });
 }
 
-// This overwrites the content of outarr
-template <class scalar_t, template <class> class OP, CPUCapability C>
-inline void dimreduce_kernel_(const scalar_t *arr, scalar_t *outarr,
-                              size_t num_rows, size_t num_cols) {
-  size_t width =
-      256 / (sizeof(scalar_t)); // primitives per 256 bytes (two cache lines)
-  Vec256<scalar_t> a[8];
-  Vec256<scalar_t> b[8];
-  constexpr size_t epr = 32 / sizeof(scalar_t); // primitives per Vec256
-  size_t tile = 0;
-  for (; tile < (num_cols) / width; tile++) {
-    size_t row_ind = tile * width;
-    for (size_t i = 0; i < num_rows; i += 1) {
-      for (int ib = 0; ib < 8; ib++) {
-        if (i == 0) {
-          b[ib].load(arr + i * num_cols + tile * width + ib * epr);
-        } else {
-          a[ib].load(arr + i * num_cols + tile * width + ib * epr);
-          b[ib] = OP<Vec256<scalar_t>>()(b[ib], a[ib]);
-        }
-      }
-    }
-    for (int ib = 0; ib < 8; ib++) {
-      b[ib].store(outarr + row_ind + ib * epr);
-    }
-  }
-  size_t k = tile * width;
-  for (; k < num_cols; k++) {
-    for (size_t i = 0; i < num_rows; i += 1) {
-      if (i == 0) {
-        outarr[k] = arr[i * num_cols + k];
-      } else {
-        outarr[k] = OP<scalar_t>()(outarr[k], arr[i * num_cols + k]);
-      }
-    }
-  }
+static void mean_kernel_impl(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(), "mean_cpu", [&] {
+    scalar_t factor = scalar_t(iter.num_output_elements()) / iter.numel();
+    binary_kernel_reduce(
+      iter,
+      MeanOps<scalar_t, scalar_t> {factor},
+      scalar_t(0)
+    );
+  });
 }
 
-template <template <class> class OP, CPUCapability C>
-inline void allImpl(Tensor & result, const Tensor & self, size_t dim, bool all, const char* name, int64_t init) {
-  AT_DISPATCH_ALL_TYPES(self.type(), name, [&] {
-    if (all) {
-      result.fill_(at::parallel_reduce<scalar_t, OP>(
-          &allreduce_kernel_<scalar_t, OP, CURRENT_CAPABILITY>, self.data<scalar_t>(),
-          (size_t)0, (size_t)self.numel(), (scalar_t)init));
-    } else {
-      at::parallel_reduce_2d<scalar_t>(
-          &dimreduce_kernel_<scalar_t, OP, CURRENT_CAPABILITY>,
-          self.sizes()[dim], self.strides()[dim], self.numel(),
-          self.data<scalar_t>(), result.data<scalar_t>());
-    }
+static void std_var_kernel_impl(TensorIterator &iter, bool unbiased, bool take_sqrt) {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(iter.dtype(), "std_cpu", [&] {
+    binary_kernel_reduce(
+      iter,
+      WelfordOps<scalar_t, double, int64_t, double, std::tuple<scalar_t, scalar_t>> { unbiased, take_sqrt },
+      WelfordData<double, int64_t, double>()
+    );
+  });
+}
+
+static void prod_kernel_impl(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(), "prod_cpu", [&] {
+    binary_kernel_reduce_vec(
+      iter,
+      [=](scalar_t a, scalar_t b) -> scalar_t { return a * b; },
+      [=](Vec256<scalar_t> a, Vec256<scalar_t> b) { return a * b; },
+      /*identity=*/1);
+  });
+}
+
+static void norm_kernel_tensor_iterator_impl(
+    TensorIterator& iter,
+    Scalar p) {
+  float val;
+  if (p.isIntegral(false)) {
+    val = p.to<int64_t>();
+  } else if (p.isFloatingPoint()) {
+    val = p.to<float>();
+  } else {
+    AT_ERROR("norm_kernel_tensor_iterator_impl expects norm to be integer or float");
+  }
+
+
+  if (val == 0) {
+    AT_DISPATCH_FLOATING_TYPES(iter.dtype(), "norm_cpu", [&] {
+      binary_kernel_reduce(
+        iter,
+        NormZeroOps<scalar_t>(),
+        scalar_t(0)
+      );
     });
+  } else if (val == 1) {
+    AT_DISPATCH_FLOATING_TYPES(iter.dtype(), "norm_cpu", [&] {
+      binary_kernel_reduce(
+        iter,
+        NormOneOps<scalar_t>(),
+        scalar_t(0)
+      );
+    });
+  } else if (val == INFINITY) {
+    AT_DISPATCH_FLOATING_TYPES(iter.dtype(), "norm_cpu", [&] {
+      binary_kernel_reduce(
+        iter,
+        AbsMaxOps<scalar_t>(),
+        std::numeric_limits<scalar_t>::min()
+      );
+    });
+  } else if (val == -INFINITY) {
+    AT_DISPATCH_FLOATING_TYPES(iter.dtype(), "norm_cpu", [&] {
+      binary_kernel_reduce(
+        iter,
+        AbsMinOps<scalar_t>(),
+        std::numeric_limits<scalar_t>::max()
+      );
+    });
+  } else {
+    AT_DISPATCH_FLOATING_TYPES(iter.dtype(), "norm_cpu", [&] {
+      binary_kernel_reduce(
+        iter,
+        NormOps<scalar_t> { scalar_t(val) },
+        scalar_t(0)
+      );
+    });
+  }
 }
 
-template <>
-void sumImplC<CURRENT_CAPABILITY>::function(Tensor &result, const Tensor &self,
-                                            size_t dim, bool all) {
-  allImpl<std::plus, CURRENT_CAPABILITY>(result, self, dim, all, "sum", 0);
+static void and_kernel_impl(TensorIterator& iter) {
+  binary_kernel_reduce_vec(
+    iter,
+    [=](uint8_t a, uint8_t b) -> uint8_t { return a && b; },
+    [=](Vec256<uint8_t> a, Vec256<uint8_t> b) {
+      // Adding the implementation here instead of in vec256_base to avoid
+      // return value inconsistency. Other comparison operators in vec256_base
+      // return -1/0 (all bit 1 / all bit 0) as true/false to follow the AVX2
+      // convention. This would be convenient when combined with other
+      // vectorized operations. For example, one can use the logical operation
+      // results as a mask for a bit operation to retrieve/reset multiple
+      // elements in a vector.
+      //
+      // In this method, users would expect, e.g., all(), to return 1/0 as
+      // true/false.
+      Vec256<uint8_t> c = Vec256<uint8_t>();
+      for (int i = 0; i != Vec256<uint8_t>::size(); i++) {
+        c[i] = a[i] && b[i];
+      }
+      return c;
+    },
+    /*ident=*/true);
 }
 
-template <>
-void prodImplC<CURRENT_CAPABILITY>::function(Tensor &result, const Tensor &self,
-                                             size_t dim, bool all) {
-  allImpl<std::multiplies, CURRENT_CAPABILITY>(result, self, dim, all, "prod", 1);
+static void or_kernel_impl(TensorIterator& iter) {
+  binary_kernel_reduce_vec(
+    iter,
+    [=](uint8_t a, uint8_t b) -> uint8_t { return a || b; },
+    [=](Vec256<uint8_t> a, Vec256<uint8_t> b) {
+      Vec256<uint8_t> c = Vec256<uint8_t>();
+      for (int i = 0; i != Vec256<uint8_t>::size(); i++) {
+        c[i] = a[i] || b[i];
+      }
+      return c;
+    },
+    /*ident=*/false);
 }
+
+static void min_values_kernel_impl(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(), "min_values_cpu", [&iter] {
+    binary_kernel_reduce_vec(
+      iter,
+      [](scalar_t a, scalar_t b) -> scalar_t { return std::min(a, b); },
+      [](Vec256<scalar_t> a, Vec256<scalar_t> b) { return minimum(a, b); });
+  });
 }
+
+static void max_values_kernel_impl(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(), "max_values_cpu", [&iter] {
+    binary_kernel_reduce_vec(
+      iter,
+      [](scalar_t a, scalar_t b) -> scalar_t { return std::max(a, b); },
+      [](Vec256<scalar_t> a, Vec256<scalar_t> b) { return maximum(a, b); });
+  });
 }
+
+// Maximum and minimum possible scalar values, including infinities
+
+template <typename scalar_t>
+constexpr scalar_t upper_bound() {
+  using lim = std::numeric_limits<scalar_t>;
+  return lim::has_infinity ? lim::infinity() : lim::max();
+}
+
+template <typename scalar_t>
+constexpr scalar_t lower_bound() {
+  using lim = std::numeric_limits<scalar_t>;
+  return lim::has_infinity ? -lim::infinity() : lim::lowest();
+}
+
+static void argmax_kernel_impl(TensorIterator &iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(1), "argmax_cpu", [&] {
+    binary_kernel_reduce(
+      iter,
+      ArgMaxOps<scalar_t>{},
+      std::pair<scalar_t, int64_t>(lower_bound<scalar_t>(), -1));
+  });
+}
+
+static void argmin_kernel_impl(TensorIterator &iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(1), "argmin_cpu", [&] {
+    binary_kernel_reduce(
+      iter,
+      ArgMinOps<scalar_t>{},
+      std::pair<scalar_t, int64_t>(upper_bound<scalar_t>(), -1));
+  });
+}
+
+}  // anonymous namespace
+
+REGISTER_DISPATCH(sum_stub, &sum_kernel_impl);
+REGISTER_DISPATCH(std_var_stub, &std_var_kernel_impl);
+REGISTER_DISPATCH(prod_stub, &prod_kernel_impl);
+REGISTER_DISPATCH(mean_stub, &mean_kernel_impl);
+REGISTER_DISPATCH(norm_stub, &norm_kernel_tensor_iterator_impl);
+REGISTER_DISPATCH(and_stub, &and_kernel_impl);
+REGISTER_DISPATCH(or_stub, &or_kernel_impl);
+REGISTER_DISPATCH(min_values_stub, &min_values_kernel_impl);
+REGISTER_DISPATCH(max_values_stub, &max_values_kernel_impl);
+REGISTER_DISPATCH(argmax_stub, &argmax_kernel_impl);
+REGISTER_DISPATCH(argmin_stub, &argmin_kernel_impl);
+
+}}  // namespace at::native

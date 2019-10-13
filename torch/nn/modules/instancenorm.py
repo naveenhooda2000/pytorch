@@ -9,7 +9,37 @@ class _InstanceNorm(_BatchNorm):
             num_features, eps, momentum, affine, track_running_stats)
 
     def _check_input_dim(self, input):
-        return NotImplemented
+        raise NotImplementedError
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        version = local_metadata.get('version', None)
+        # at version 1: removed running_mean and running_var when
+        # track_running_stats=False (default)
+        if version is None and not self.track_running_stats:
+            running_stats_keys = []
+            for name in ('running_mean', 'running_var'):
+                key = prefix + name
+                if key in state_dict:
+                    running_stats_keys.append(key)
+            if len(running_stats_keys) > 0:
+                error_msgs.append(
+                    'Unexpected running stats buffer(s) {names} for {klass} '
+                    'with track_running_stats=False. If state_dict is a '
+                    'checkpoint saved before 0.4.0, this may be expected '
+                    'because {klass} does not track running stats by default '
+                    'since 0.4.0. Please remove these keys from state_dict. If '
+                    'the running stats are actually needed, instead set '
+                    'track_running_stats=True in {klass} to enable them. See '
+                    'the documentation of {klass} for details.'
+                    .format(names=" and ".join('"{}"'.format(k) for k in running_stats_keys),
+                            klass=self.__class__.__name__))
+                for key in running_stats_keys:
+                    state_dict.pop(key)
+
+        super(_InstanceNorm, self)._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, input):
         self._check_input_dim(input)
@@ -20,13 +50,13 @@ class _InstanceNorm(_BatchNorm):
 
 
 class InstanceNorm1d(_InstanceNorm):
-    r"""Applies Instance Normalization over a 2D or 3D input (a mini-batch of 1D
+    r"""Applies Instance Normalization over a 3D input (a mini-batch of 1D
     inputs with optional additional channel dimension) as described in the paper
     `Instance Normalization: The Missing Ingredient for Fast Stylization`_ .
 
     .. math::
 
-        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x]} + \epsilon} * \gamma + \beta
+        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \epsilon}} * \gamma + \beta
 
     The mean and standard-deviation are calculated per-dimension separately
     for each object in a mini-batch. :math:`\gamma` and :math:`\beta` are learnable parameter vectors
@@ -48,13 +78,23 @@ class InstanceNorm1d(_InstanceNorm):
         where :math:`\hat{x}` is the estimated statistic and :math:`x_t` is the
         new observed value.
 
+    .. note::
+        :class:`InstanceNorm1d` and :class:`LayerNorm` are very similar, but
+        have some subtle differences. :class:`InstanceNorm1d` is applied
+        on each channel of channeled data like multidimensional time series, but
+        :class:`LayerNorm` is usually applied on entire sample and often in NLP
+        tasks. Additionaly, :class:`LayerNorm` applies elementwise affine
+        transform, while :class:`InstanceNorm1d` usually don't apply affine
+        transform.
+
     Args:
         num_features: :math:`C` from an expected input of size
             :math:`(N, C, L)` or :math:`L` from input of size :math:`(N, L)`
         eps: a value added to the denominator for numerical stability. Default: 1e-5
         momentum: the value used for the running_mean and running_var computation. Default: 0.1
         affine: a boolean value that when set to ``True``, this module has
-            learnable affine parameters. Default: ``True``
+            learnable affine parameters, initialized the same way as done for batch normalization.
+            Default: ``False``.
         track_running_stats: a boolean value that when set to ``True``, this
             module tracks the running mean and variance, and when set to ``False``,
             this module does not track such statistics and always uses batch
@@ -78,6 +118,13 @@ class InstanceNorm1d(_InstanceNorm):
     """
 
     def _check_input_dim(self, input):
+        if input.dim() == 2:
+            raise ValueError(
+                'InstanceNorm1d returns 0-filled tensor to 2D tensor.'
+                'This is because InstanceNorm1d reshapes inputs to'
+                '(1, N * C, ...) from (N, C,...) and this makes'
+                'variances 0.'
+            )
         if input.dim() != 3:
             raise ValueError('expected 3D input (got {}D input)'
                              .format(input.dim()))
@@ -90,7 +137,7 @@ class InstanceNorm2d(_InstanceNorm):
 
     .. math::
 
-        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x]} + \epsilon} * \gamma + \beta
+        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \epsilon}} * \gamma + \beta
 
     The mean and standard-deviation are calculated per-dimension separately
     for each object in a mini-batch. :math:`\gamma` and :math:`\beta` are learnable parameter vectors
@@ -112,13 +159,23 @@ class InstanceNorm2d(_InstanceNorm):
         where :math:`\hat{x}` is the estimated statistic and :math:`x_t` is the
         new observed value.
 
+    .. note::
+        :class:`InstanceNorm2d` and :class:`LayerNorm` are very similar, but
+        have some subtle differences. :class:`InstanceNorm2d` is applied
+        on each channel of channeled data like RGB images, but
+        :class:`LayerNorm` is usually applied on entire sample and often in NLP
+        tasks. Additionaly, :class:`LayerNorm` applies elementwise affine
+        transform, while :class:`InstanceNorm2d` usually don't apply affine
+        transform.
+
     Args:
         num_features: :math:`C` from an expected input of size
             :math:`(N, C, H, W)`
         eps: a value added to the denominator for numerical stability. Default: 1e-5
         momentum: the value used for the running_mean and running_var computation. Default: 0.1
         affine: a boolean value that when set to ``True``, this module has
-            learnable affine parameters. Default: ``True``
+            learnable affine parameters, initialized the same way as done for batch normalization.
+            Default: ``False``.
         track_running_stats: a boolean value that when set to ``True``, this
             module tracks the running mean and variance, and when set to ``False``,
             this module does not track such statistics and always uses batch
@@ -154,7 +211,7 @@ class InstanceNorm3d(_InstanceNorm):
 
     .. math::
 
-        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x]} + \epsilon} * \gamma + \beta
+        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \epsilon}} * \gamma + \beta
 
     The mean and standard-deviation are calculated per-dimension separately
     for each object in a mini-batch. :math:`\gamma` and :math:`\beta` are learnable parameter vectors
@@ -176,13 +233,23 @@ class InstanceNorm3d(_InstanceNorm):
         where :math:`\hat{x}` is the estimated statistic and :math:`x_t` is the
         new observed value.
 
+    .. note::
+        :class:`InstanceNorm3d` and :class:`LayerNorm` are very similar, but
+        have some subtle differences. :class:`InstanceNorm3d` is applied
+        on each channel of channeled data like 3D models with RGB color, but
+        :class:`LayerNorm` is usually applied on entire sample and often in NLP
+        tasks. Additionaly, :class:`LayerNorm` applies elementwise affine
+        transform, while :class:`InstanceNorm3d` usually don't apply affine
+        transform.
+
     Args:
         num_features: :math:`C` from an expected input of size
             :math:`(N, C, D, H, W)`
         eps: a value added to the denominator for numerical stability. Default: 1e-5
         momentum: the value used for the running_mean and running_var computation. Default: 0.1
         affine: a boolean value that when set to ``True``, this module has
-            learnable affine parameters. Default: ``True``
+            learnable affine parameters, initialized the same way as done for batch normalization.
+            Default: ``False``.
         track_running_stats: a boolean value that when set to ``True``, this
             module tracks the running mean and variance, and when set to ``False``,
             this module does not track such statistics and always uses batch

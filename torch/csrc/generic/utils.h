@@ -1,8 +1,8 @@
 #ifndef TH_GENERIC_FILE
-#define TH_GENERIC_FILE "generic/utils.h"
+#define TH_GENERIC_FILE "torch/csrc/generic/utils.h"
 #else
 
-#if defined(THD_GENERIC_FILE) || defined(TH_REAL_IS_HALF)
+#if defined(TH_REAL_IS_HALF)
 #define GENERATE_SPARSE 0
 #else
 #define GENERATE_SPARSE 1
@@ -11,18 +11,14 @@
 struct THPStorage;
 struct THSPTensor;
 
-typedef class THPPointer<THStorage>      THStoragePtr;
-typedef class THPPointer<THTensor>       THTensorPtr;
+typedef class THPPointer<THWStorage>      THWStoragePtr;
+typedef class THPPointer<THWTensor>       THWTensorPtr;
 typedef class THPPointer<THPStorage>     THPStoragePtr;
 
-#if GENERATE_SPARSE
-typedef class THPPointer<THSTensor>      THSTensorPtr;
-#endif
-
-#if (!defined(THC_GENERIC_FILE) || defined(THC_REAL_IS_HALF)) && \
-    (!defined(THD_GENERIC_FILE))
+#if (!defined(THC_GENERIC_FILE)) && \
+    (!defined(THQUANTIZED))
 template<>
-struct THPUtils_typeTraits<real> {
+struct THPUtils_typeTraits<scalar_t> {
 #if defined(TH_REAL_IS_FLOAT) || defined(TH_REAL_IS_DOUBLE) || \
     defined(THC_REAL_IS_FLOAT) || defined(THC_REAL_IS_DOUBLE) || \
     defined(THC_REAL_IS_HALF)

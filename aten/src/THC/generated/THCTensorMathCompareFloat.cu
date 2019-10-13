@@ -1,3 +1,3 @@
-#include "../THCTensorMathCompare.cuh"
-#include "../generic/THCTensorMathCompare.cu"
-#include "../THCGenerateFloatType.h"
+#include <THC/THCTensorMathCompare.cuh>
+#include <THC/THCTensor.hpp>
+

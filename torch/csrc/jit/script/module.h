@@ -1,14 +1,55 @@
 #pragma once
-#include "torch/csrc/jit/ir.h"
-#include "torch/csrc/jit/graph_executor.h"
-#include "torch/csrc/autograd/variable.h"
-#include <ATen/optional.h>
+#include <c10/util/Exception.h>
+#include <torch/csrc/autograd/variable.h>
+#include <torch/csrc/jit/argument_spec.h>
+#include <torch/csrc/jit/graph_executor.h>
+#include <torch/csrc/jit/ir.h>
+#include <torch/csrc/jit/named_value.h>
+#include <torch/csrc/jit/passes/shape_analysis.h>
+#include <torch/csrc/jit/script/slot.h>
+#include <torch/csrc/jit/source_range.h>
+
+#include <torch/csrc/WindowsTorchApiMacro.h>
+#include <torch/csrc/api/include/torch/ordered_dict.h>
+#include <torch/csrc/jit/script/compilation_unit.h>
+#include <torch/csrc/utils/memory.h>
+
+#include <ATen/core/function_schema.h>
+#include <ATen/core/qualified_name.h>
+#include <c10/util/ArrayRef.h>
+#include <c10/util/Optional.h>
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 // This file contains classes which assist in desugaring Python style
 // modules and their methods into flattened graphs which don't have any
 // function calls.
 
-namespace torch { namespace jit { namespace script {
+namespace torch {
+namespace jit {
+namespace script {
+
+using ::c10::Argument;
+using ::c10::FunctionSchema;
+using ::c10::QualifiedName;
+// Map which stores filename to content.
+using ExtraFilesMap = std::unordered_map<std::string, std::string>;
+
+using ModulePtr = c10::intrusive_ptr<c10::ivalue::Object>;
+
+struct Module;
+
+template <typename T>
+struct slot_list_impl;
+using slot_list = slot_list_impl<Slot>;
+using module_list = slot_list_impl<Module>;
+using ModuleLookup = std::function<Module(const std::vector<std::string>&)>;
 
 // A method in a module, e.g. f in:
 //
@@ -18,256 +59,485 @@ namespace torch { namespace jit { namespace script {
 //     ...
 // Note: because Method/Module are exposed to python these
 // classes use python method naming conventions
+struct TORCH_API Method {
+  Method(ModulePtr owner, Function* function);
 
-struct Method {
-  Method(std::string name, bool optimize,
-         std::shared_ptr<Graph> graph,
-         std::vector<at::Tensor*> initial_members)
-  : name_(std::move(name))
-  , graph_(std::move(graph))
-  , optimize(optimize)
-  , member_inputs(std::move(initial_members)) {
-    JIT_ASSERT(graph_->inputs().size() >= member_inputs.size());
-    int i = graph_->inputs().size() - member_inputs.size();
-    for(at::Tensor* member : member_inputs) {
-      member_input_index[member] = i++;
-    }
+  // the module that contains this method.
+  Module owner() const;
+  void run(Stack& stack);
+  void run(Stack&& stack) {
+    run(stack);
   }
 
-  variable_tensor_list run(variable_tensor_list && inputs) {
-    std::call_once(executor_init, [&]{
-      executor = GraphExecutor(graph_, optimize);
-    });
-    for(auto tp : member_inputs) {
-      inputs.push_back(*tp);
-    }
-    return executor.run(std::move(inputs));
-  }
+  IValue operator()(std::vector<IValue> stack, const Kwargs& kwargs = Kwargs());
+
   std::shared_ptr<Graph> graph() const {
-    return graph_;
+    return function_->graph();
   }
 
-  const std::string & name() const {
-    return name_;
+  const std::string& name() const {
+    return function_->name();
   }
-  // emit a function call by inlining the callees Graph into this one
-  // adding any extra parameters necessary to do this call
-
-  // defined here to keep details of member_input handling confined to this class
-  std::vector<Value*> emit_call_to(Method & callee, ArrayRef<Value*> inputs);
 
   size_t num_inputs() const {
-    return graph_->inputs().size() - member_inputs.size();
+    return function_->num_inputs();
   }
-  Value * get_or_add_parameter(at::Tensor* slot) {
-    auto it = member_input_index.find(slot);
-    if(it != member_input_index.end()) {
-      return graph()->inputs().at(it->second);
-    }
-    // add it as a new parameter
-    member_inputs.push_back(slot);
-    member_input_index[slot] = graph()->inputs().size();
-    return graph()->addInput();
+
+  GraphExecutor& get_executor() {
+    return function_->get_executor();
   }
-private:
-  std::string name_;
-  std::shared_ptr<Graph> graph_; // for debugging and for inlining
-  bool optimize;
-  GraphExecutor executor; // for execution
-  // member_inputs are a list of additional arguments appended to graph that are
-  // inputs that come from the members of the Module or its submodules.
-  // each is a pointer to a slot in the module that owns this parameter
-  // parameters and submodules can only be _added_ to script Modules to ensure
-  // these pointers always stay valid
-  std::vector<at::Tensor*> member_inputs;
 
-  // map from a at::Tensor* in member_inputs to the offset it appears at
-  // in graph. used to accelerate get_or_add_parameter
-  std::unordered_map<at::Tensor*, size_t> member_input_index;
+  Function& function() const {
+    return *function_;
+  }
 
-  // TODO: support that case where we allow _writes_ to parameters from
-  // compiled functions.
-  // This requires more sophisticated tracking of ssa values in Graphs so that
-  // stores to all modules can be lifted to the end of a graph execution.
-  // It also adds more complexity to adding actual module invocations
-  // to the executor, so currently it is not done.
-  // std::vector<at::Tensor*> member_outputs;
+  // Used for ONNX export. Return a tuple (graph, parameters) where
+  // the last parameters.size() inputs to the graph are the trainable parameters
+  // used in this method. The remaining inputs are the true inputs to the function.
+  std::pair<std::shared_ptr<Graph>, std::vector<at::Tensor>> _lowered_graph();
 
-  std::once_flag executor_init;
+ private:
+  // Methods are uniqued onwed by a single module. This raw pointer allows
+  // looking up the module.
+  ModulePtr owner_;
+
+  // Underlying unbound function
+  // This is the _lowered_ function and is different than the
+  // first-class function in class_compilation_unit()
+  Function* function_;
 };
 
-struct Module;
+struct TORCH_API Module {
+  explicit Module(c10::QualifiedName class_name);
+  Module(std::shared_ptr<CompilationUnit> cu, const c10::ClassTypePtr& type);
+  Module(
+      c10::QualifiedName,
+      std::shared_ptr<CompilationUnit> cu,
+      bool shouldMangle = false);
+  // module_value_ null and will be lazily initialized if is needed
+  Module() {}
+  Module(ModulePtr module_value) : module_value_(std::move(module_value)) {}
+  ~Module() {}
 
-struct NamedModule {
-  std::string name;
-  std::shared_ptr<Module> module;
-};
+  const c10::QualifiedName& name() const {
+    return *module_object()->type()->name();
+  }
 
-struct NamedParameter {
-  NamedParameter(std::string name, at::Tensor tensor, bool is_buffer)
-  : name(std::move(name))
-  , is_buffer(is_buffer)
-  , parameter(new at::Tensor(std::move(tensor))) {}
-
-  const std::string name;
-  bool is_buffer; // buffers are part of the module state but
-                        // are not modified by optimizers during SGD
-  at::Tensor* slot() const {
-    return parameter.get();
-  }
-private:
-  // the extra level of indirection allows Methods to safely store pointers
-  // to the slots where parameters are kept while also allow parameters
-  // to be reassigned
-  std::unique_ptr<at::Tensor> parameter;
-};
-
-// simple ordered dict used only in Module
-// contains only the minimum necessary functionality for Module
-template<typename T>
-struct OrderedDict {
-  OrderedDict(const char * what)
-  : what(what) {}
-  // note: slight difference from python here.
-  // we do not allow for insertion of an already existing value,
-  // because we not allow allow methods or submodules to be updated
-  // once created
-  T& insert(const std::string& name,  T&& value) {
-    if(index_.count(name) != 0) {
-      std::stringstream ss;
-      ss << "module " << what << "'" << name << "' already defined.";
-      throw std::runtime_error(ss.str());
-    }
-    values_.push_back(std::move(value));
-    index_[name] = values_.size() - 1;
-    return values_.back();
-  }
-  at::optional<T&> find(const std::string& str) {
-    auto it = index_.find(str);
-    if(it == index_.end())
-      return at::nullopt;
-    return at::optional<T&>(values_.at(it->second));
-  }
-  at::optional<const T&> find(const std::string& str) const {
-    auto it = index_.find(str);
-    if(it == index_.end())
-      return at::nullopt;
-    return at::optional<const T&>(values_.at(it->second));
-  }
-  T& get(const std::string& name) {
-    if(auto v = find(name)) {
-      return *v;
-    }
-    std::stringstream ss;
-    ss << "module " << what << "'" << name << "' is not defined.";
-    throw std::runtime_error(ss.str());
-  }
-  const T& get(const std::string& name) const {
-    if(auto v = find(name)) {
-      return *v;
-    }
-    std::stringstream ss;
-    ss << "module " << what << "'" << name << "' is not defined.";
-    throw std::runtime_error(ss.str());
-  }
-  const std::vector<T>& values() const {
-    return values_;
-  }
-private:
-  std::unordered_map<std::string, size_t> index_;
-  std::vector<T> values_;
-  const char * what;
-};
-
-struct Module : public std::enable_shared_from_this<Module> {
-  TH_DISALLOW_COPY_AND_ASSIGN(Module);
-  Module()
-  : modules("modules")
-  , parameters("parameters")
-  , methods("methods")
-  , optimize(true) {}
-
-  // note this doesn't change the flags of existing methods just ones
-  // added afterward.
   void set_optimized(bool o) {
-    optimize = o;
+    AT_WARN(
+        "Module::set_optimized() is deprecated and has no effect. "
+        "Please use setGraphExecutorOptimize()");
   }
 
-  void register_parameter(const std::string & name, autograd::Variable v, bool is_buffer) {
-    if(auto p = parameters.find(name)){
-      *p->slot() = v;
-      p->is_buffer = is_buffer;
-      return;
-    }
-    parameters.insert(name, NamedParameter(name, std::move(v), is_buffer));
-  }
-  void register_module(const std::string& name, std::shared_ptr<Module> module) {
-    modules.insert(name, {name, std::move(module)});
+  bool is_optimized() const {
+    AT_WARN(
+        "Module::is_optimized() is deprecated and always returns true. "
+        "Please use getGraphExecutorOptimize()");
+    return true;
   }
 
-  Method& create_method(const std::string & name, std::shared_ptr<Graph> graph = nullptr, std::vector<at::Tensor*> member_inputs = {}) {
-    if(!graph)
-      graph = std::make_shared<Graph>();
-    std::unique_ptr<Method> method(new Method(name, optimize, std::move(graph), std::move(member_inputs)));
-
-    return *methods.insert(name, std::move(method));
+  IValue forward(std::vector<IValue> inputs) {
+    return get_method("forward")(std::move(inputs));
   }
 
-  at::Tensor* parameter_slot(const std::string & name) const {
-    return parameters.get(name).slot();
+  // In script modules, buffers are Tensors attribute that are _not_ registered
+  // as parameters. This is different than in nn.Module where there is a special
+  // register_buffer method. With this simplification, we only need to track
+  // whether a slot is a parameter to be able to classify it.
+  void register_buffer(const std::string& name, autograd::Variable v) {
+    type()->addOrCheckAttribute(name, TensorType::get());
+    module_object()->setAttr(name, v);
+  }
+  void register_parameter(
+      const std::string& name,
+      autograd::Variable v,
+      bool is_buffer) {
+    type()->addOrCheckAttribute(name, TensorType::get(), !is_buffer);
+    module_object()->setAttr(name, v);
+  }
+  void register_attribute(
+      const std::string& name,
+      const TypePtr t,
+      IValue v,
+      bool is_param = false) {
+    type()->addOrCheckAttribute(name, t, is_param);
+    module_object()->setAttr(name, v);
+  }
+  void register_module(const std::string& name, const Module& module) {
+    type()->addOrCheckAttribute(name, module.type());
+    module_object()->setAttr(name, module.module_object());
   }
 
-  void set_parameter(const std::string & name, at::Tensor v) {
-    *parameter_slot(name) = std::move(v);
+  void set_parameter(const std::string& name, at::Tensor v) {
+    get_slot(name, EntityType::PARAMETER).setValue(v);
   }
 
   autograd::Variable get_parameter(const std::string& name) const {
-    return static_cast<autograd::Variable&>(*parameter_slot(name));
+    return autograd::as_variable_ref(
+        get_slot(name, EntityType::PARAMETER).value().toTensor());
+  }
+
+  IValue get_attribute(const std::string& name) const {
+    return get_slot(name, EntityType::ATTRIBUTE).value();
+  }
+
+  autograd::Variable get_buffer(const std::string& name) const {
+    return autograd::as_variable_ref(get_attribute(name).toTensor());
   }
 
   // each module owns its method. The reference returned here
-  // is guarenteed to stay valid until this module has been destoryed
-  Method& get_method(const std::string& name) const {
-    return *methods.get(name);
+  // is guarenteed to stay valid until this module has been destroyed
+  Method get_method(const std::string& name) const {
+    if (auto method = find_method(name)) {
+      return *method;
+    }
+    AT_ERROR("Method '", name, "' is not defined.");
   }
 
-  std::shared_ptr<Module> get_module(const std::string& name) const {
-    return modules.get(name).module;
+  Module get_module(const std::string& name) const {
+    auto obj = get_slot(name, EntityType::MODULE).value().toObject();
+    return Module(obj);
   }
 
-  const std::vector<NamedModule>& get_modules() const {
-    return modules.values();
-  }
-  const  std::vector<NamedParameter>& get_parameters() const {
-    return parameters.values();
-  }
-  const  std::vector<std::unique_ptr<Method>>& get_methods() const {
-    return methods.values();
+  module_list get_modules() const;
+  slot_list get_slots() const;
+  slot_list get_parameters() const;
+  slot_list get_attributes() const;
+  slot_list get_module_slots() const;
+
+  void dump(
+      bool print_method_bodies,
+      bool print_attr_values,
+      bool print_param_values) const;
+
+  std::string dump_to_str(
+      bool print_method_bodies,
+      bool print_attr_values,
+      bool print_param_values,
+      int level) const;
+
+  const std::vector<Method> get_methods() const {
+    return fmap(
+        type()->methods(),
+        [&](Function* func) {
+          return Method(module_object(), func);
+        });
   }
 
-
-  at::optional<NamedParameter&> find_parameter(const std::string& name) {
-    return parameters.find(name);
+  c10::optional<Slot> find_parameter(const std::string& name) const {
+    return find_slot(name, EntityType::PARAMETER);
   }
-  at::optional<NamedModule&> find_module(const std::string& name) {
-    return modules.find(name);
+  c10::optional<Slot> find_attribute(const std::string& name) {
+    return find_slot(name, EntityType::ATTRIBUTE);
   }
-  at::optional<Method&> find_method(const std::string& name) {
-    if(auto pm = methods.find(name))
-      return at::optional<Method&>(**pm);
-    return at::nullopt;
+  c10::optional<Slot> find_buffer(const std::string& name) {
+    auto iv = find_attribute(name);
+    if (iv && iv->type()->isSubtypeOf(TensorType::get())) {
+      return iv;
+    }
+    return c10::nullopt;
+  }
+  c10::optional<Module> find_module(const std::string& name) const {
+    if (auto slot = find_slot(name, EntityType::MODULE)) {
+      return Module(slot->value().toObject());
+    }
+    return c10::nullopt;
+  }
+  c10::optional<Method> find_method(const std::string& basename) const {
+    for (Function* fn : type()->methods()) {
+      if (fn->name() == basename) {
+        return Method(module_object(), fn);
+      }
+
+    }
+    return c10::nullopt;
+  }
+  void apply(const std::function<void(Module&)>& fn);
+
+  /// Enables "training" mode.
+  void train(bool on = true);
+  /// Calls train(false) to enable "eval" mode.
+  /// Do not override this method, override `train()` instead.
+  void eval() {
+    train(/*on=*/false);
+  }
+  /// True if the module is in training mode.
+  bool is_training() {
+    if (auto p = find_attribute("training")) {
+      return p->value().toBool();
+    }
+
+    // We are in training mode by default
+    return true;
   }
 
-private:
+  /// Recursively casts all parameters to the given `dtype` and `device`.
+  ///
+  /// If `non_blocking` is true and the source is in pinned memory and
+  /// destination is on the GPU or vice versa, the copy is performed
+  /// asynchronously with respect to the host. Otherwise, the argument has no
+  /// effect.
+  void to(at::Device device, at::ScalarType dtype, bool non_blocking = false);
 
-  // invariant: to ensure member_inputs of Methods stay valid,
-  // it is only legal to _add_ new modules and parameters.
-  // removing them will allow member_inputs to point to invalid parameters
-  // no such restriction exists for methods
-  OrderedDict<NamedModule> modules;
-  OrderedDict<NamedParameter> parameters;
-  OrderedDict<std::unique_ptr<Method>> methods;
-  bool optimize;
+  /// Recursively casts all parameters to the given dtype.
+  ///
+  /// If `non_blocking` is true and the source is in pinned memory and
+  /// destination is on the GPU or vice versa, the copy is performed
+  /// asynchronously with respect to the host. Otherwise, the argument has no
+  /// effect.
+  void to(at::ScalarType dtype, bool non_blocking = false);
+
+  /// Recursively moves all parameters to the given device.
+  ///
+  /// If `non_blocking` is true and the source is in pinned memory and
+  /// destination is on the GPU or vice versa, the copy is performed
+  /// asynchronously with respect to the host. Otherwise, the argument has no
+  /// effect.
+  void to(at::Device device, bool non_blocking = false);
+
+  /// Run a method from this module.
+  ///
+  /// For example:
+  /// @code
+  ///   IValue output = module->run("relu_script", a, b);
+  /// @endcode
+  ///
+  /// To get a compile a module from a source string, see torch::jit::compile
+  ///
+  /// @param method_name The name of the method to run
+  /// @param args Arguments to be passed to the method
+  /// @return An IValue containing the return value (or values if it is a tuple)
+  /// from the method
+  template <typename... Types>
+  IValue run_method(const std::string& method_name, Types&&... args) {
+    return get_method(method_name)({IValue(std::forward<Types>(args))...});
+  }
+
+  void save(
+      std::ostream& out,
+      const ExtraFilesMap& extra_files = ExtraFilesMap()) const;
+
+  void save(
+      const std::string& filename,
+      const ExtraFilesMap& extra_files = ExtraFilesMap()) const;
+
+  void _save_for_mobile(
+      std::ostream& out,
+      const ExtraFilesMap& extra_files = ExtraFilesMap()) const;
+
+  void _save_for_mobile(
+      const std::string& filename,
+      const ExtraFilesMap& extra_files = ExtraFilesMap()) const;
+
+  // Create a deep copy of this module.
+  Module clone() const;
+
+  void clone_method(const Module& orig, const std::string& name);
+
+  at::optional<EntityType> kind_of(const std::string& name) const {
+    if (find_method(name)) {
+      return EntityType::METHOD;
+    }
+    if (auto offset = type()->findAttributeSlot(name)) {
+      return get_slot(*offset).entity_type();
+    }
+    return c10::nullopt;
+  }
+
+  ModulePtr module_object() const;
+
+  ClassTypePtr type() const {
+    return module_object()->type();
+  }
+  std::shared_ptr<CompilationUnit> class_compilation_unit() const {
+    return module_object()->compilation_unit();
+  }
+
+  // so that C++ users can easily add methods
+  void define(const std::string& src, const ResolverPtr& resolver = nullptr);
+
+  template <typename... Types>
+  IValue create_class(const c10::QualifiedName& name, Types&&... args) const {
+    return create_class(name, {IValue(std::forward<Types>(args))...});
+  }
+
+  IValue create_class(const c10::QualifiedName& name, Stack stack) const;
+
+  Slot get_slot(size_t slot) const {
+    TORCH_CHECK(
+        slot < module_object()->slots().size(), "not a valid slot offset");
+    return Slot(module_object(), slot);
+  }
+
+  size_t num_slots() const {
+    return module_object()->slots().size();
+  }
+
+ private:
+  Module clone_impl(std::unordered_map<TypePtr, TypePtr>& type_remap) const;
+
+  void clone_method(
+      const Module& orig,
+      const Function& method,
+      const std::unordered_map<TypePtr, TypePtr>& type_remap);
+
+  c10::QualifiedName getNameForMethod(std::string basename) const {
+    return QualifiedName(name(), basename);
+  }
+  static const char* toString(EntityType t) {
+    switch (t) {
+      case EntityType::MODULE:
+        return "module";
+      case EntityType::PARAMETER:
+        return "parameter";
+      case EntityType::ATTRIBUTE:
+        return "attribute";
+      case EntityType::METHOD:
+        return "method";
+    }
+    return nullptr;
+  }
+
+  Slot get_slot(const std::string& name, EntityType etype) const {
+    size_t slot_idx = type()->getAttributeSlot(name);
+    Slot slot = get_slot(slot_idx);
+    TORCH_CHECK(
+        etype == slot.entity_type(),
+        "The field '",
+        type()->getAttributeName(slot_idx),
+        "' is a ",
+        toString(slot.entity_type()),
+        " but this call is"
+        " trying to use it as a ",
+        toString(etype));
+    return slot;
+  }
+  c10::optional<Slot> find_slot(const std::string& name, EntityType etype)
+      const {
+    auto slot = type()->findAttributeSlot(name);
+    if (!slot) {
+      return c10::nullopt;
+    }
+    Slot r = get_slot(*slot);
+    if (r.entity_type() != etype) {
+      return c10::nullopt;
+    }
+    return r;
+  }
+
+  void to_impl(
+      const c10::optional<at::Device>& device,
+      const c10::optional<at::ScalarType>& dtype,
+      bool non_blocking);
+
+  // mutable be we lazily initialize in module_object.
+  mutable ModulePtr module_value_;
 };
 
-}}}
+// this iterator for the slot list defined below has a position in the list i_
+// and an optional field type_ that if present
+// restricts iteration to only the slots of module_ that
+// have EntityType *type_. This allows it to return, e.g.
+// only the parameter slots.
+// The template parameter allows us to use the same implementation for a list
+// that returns Module via template specialization of the operator* method.
+template <typename T>
+struct TORCH_API slot_iterator_impl {
+  slot_iterator_impl(Module module, c10::optional<EntityType> type, size_t i)
+      : module_(module), type_(type), i_(i) {
+    advance_to_valid();
+  }
+  T operator*() const;
+  T operator->() const {
+    return **this;
+  }
+  slot_iterator_impl& operator++() {
+    ++i_;
+    advance_to_valid();
+    return *this;
+  }
+  slot_iterator_impl operator++(int) {
+    slot_iterator_impl old = *this;
+    ++(*this);
+    return old;
+  }
+
+ private:
+  void advance_to_valid() {
+    while (i_ < module_.num_slots() &&
+           (type_ && module_.get_slot(i_).entity_type() != *type_)) {
+      ++i_;
+    }
+  }
+  Module module_;
+  c10::optional<EntityType> type_;
+  size_t i_;
+
+  template <typename TT>
+  friend inline bool operator!=(
+      const slot_iterator_impl<TT>& a,
+      const slot_iterator_impl<TT>& b);
+};
+
+template <>
+inline Slot slot_iterator_impl<Slot>::operator*() const {
+  return module_.get_slot(i_);
+}
+
+template <>
+inline Module slot_iterator_impl<Module>::operator*() const {
+  return Module(module_.get_slot(i_).to_module());
+}
+
+template <typename T>
+inline bool operator!=(
+    const slot_iterator_impl<T>& a,
+    const slot_iterator_impl<T>& b) {
+  return a.i_ != b.i_;
+}
+
+// This type represents lists of parameters, attributes, and
+// submodules contained in the module. It is abstract because
+// they are not stored directly in std::vectors but inside the
+// module's IValue object itself.
+template <typename T>
+struct TORCH_API slot_list_impl {
+  using iterator = slot_iterator_impl<T>;
+  using const_iterator = slot_iterator_impl<T>;
+  slot_iterator_impl<T> begin() const {
+    return slot_iterator_impl<T>(module_, type_, 0);
+  }
+  slot_iterator_impl<T> end() const {
+    return slot_iterator_impl<T>(module_, type_, module_.num_slots());
+  }
+  size_t size() const {
+    if (!size_) {
+      size_ = size_t(0);
+      for (T s : *(this)) {
+        ++*size_;
+      }
+    }
+    return *size_;
+  }
+
+ private:
+  slot_list_impl(Module module, c10::optional<EntityType> type)
+      : module_(std::move(module)), type_(type) {
+    if (!type_) {
+      size_ = module_.num_slots();
+    }
+  }
+  Module module_;
+  // only include Slots of the following type
+  c10::optional<EntityType> type_;
+  // size of this list, cached on first request
+  // when we need to filter the slot list
+  mutable c10::optional<size_t> size_;
+  friend struct Module;
+};
+
+TORCH_API bool& getInlineEverythingMode();
+
+} // namespace script
+} // namespace jit
+} // namespace torch

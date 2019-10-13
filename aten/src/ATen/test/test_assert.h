@@ -11,7 +11,7 @@ static inline void barf(const char *fmt, ...) {
   throw std::runtime_error(msg);
 }
 
-#if defined(_MSC_VER) && CUDA_VERSION < 9000
+#if defined(_MSC_VER) && _MSC_VER <= 1900
 #define __func__ __FUNCTION__
 #endif
 
@@ -41,7 +41,7 @@ static inline void barf(const char *fmt, ...) {
       fn;                                                       \
       _passed = true;                                           \
       els;                                                      \
-    } catch (std::runtime_error &e) {                           \
+    } catch (const std::exception &e) {                         \
       ASSERT(!_passed);                                         \
       catc;                                                     \
     }                                                           \

@@ -1,7 +1,8 @@
-#include "THCUNN.h"
-#include "common.h"
-#include "THCHalf.h"
-#include "THCHalfAutoNumerics.cuh"
+#include <THCUNN/THCUNN.h>
+#include <THCUNN/common.h>
+#include <TH/THHalf.h>
+#include <THC/THCNumerics.cuh>
+#include <THC/THCApply.cuh>
 
 #include <thrust/fill.h>
 #include <thrust/functional.h>
@@ -15,7 +16,7 @@ struct kl_functor
   __host__ __device__ Acctype operator()(const Dtype& x, const Dtype& y) const
   {
       Acctype yAcc = ScalarConvert<Dtype, Acctype>::to(y);
-      return y > 0 ? yAcc * (THCNumerics<Acctype>::log(yAcc) - x) : Acctype(0);
+      return y > 0 ? yAcc * (static_cast<Acctype>(std::log(yAcc)) - static_cast<Acctype>(x)) : Acctype(0);
   }
 };
 
@@ -27,7 +28,7 @@ struct kl_updateOutput_no_reduce_functor
       const Dtype *y,
       Dtype *output)
   {
-      *output = *y > 0 ? *y * (THCNumerics<Dtype>::log(*y) - *x) : ScalarConvert<int, Dtype>::to(0);
+      *output = *y > 0 ? *y * (static_cast<Dtype>(std::log(*y)) - *x) : ScalarConvert<int, Dtype>::to(0);
   }
 };
 
@@ -59,5 +60,5 @@ struct kl_updateGradInput_functor
   }
 };
 
-#include "generic/DistKLDivCriterion.cu"
-#include "THCGenerateFloatTypes.h"
+#include <THCUNN/generic/DistKLDivCriterion.cu>
+#include <THC/THCGenerateFloatTypes.h>
